@@ -1,4 +1,4 @@
-// Cooperative multitasking library for Arduino version 1.8.4
+// Cooperative multitasking library for Arduino version 2.0.1
 // Copyright (c) 2015 Anatoli Arkhipenko
 //
 // Changelog:
@@ -61,6 +61,24 @@
 // v1.8.4:
 //    2015-11-15 - bug fix: Task alignment with micros() for scheduling purposes should be done after OnEnable, not before. Especially since OnEnable method can change the interval
 //    2015-11-16 - further optimizations of the task scheduler execute loop
+//
+// v1.8.5:
+//    2015-11-23 - bug fix: incorrect calculation of next task invocation in case callback changed the interval
+//    2015-11-23 - bug fix: Task::set() method calls setInterval() explicitly, therefore delaying the task in the same manner
+//
+// v1.9.0:
+//    2015-11-24 - packed three byte-long status variables into bit array structure data type - saving 2 bytes per each task instance
+//
+// v1.9.2:
+//    2015-11-28 - _TASK_ROLLOVER_FIX is deprecated (not necessary)
+//    2015-12-16 - bug fixes: automatic micros rollover support for delay methods
+//    2015-12-17 - new method for _TASK_TIMECRITICAL option: getStartDelay() 
+//
+// v2.0.0:
+//    2015-12-22 - _TASK_PRIORITY - support for layered task prioritization
+//
+// v2.0.1:
+//    2016-01-02 - bug fix: issue#11 Xtensa compiler (esp8266): Declaration of constructor does not match implementation
 
 
 /* ============================================
@@ -98,12 +116,12 @@ THE SOFTWARE.
  * The following "defines" control library functionality at compile time,
  * and should be used in the main sketch depending on the functionality required
  * 
- *	#define _TASK_TIMECRITICAL      // Enable monitoring scheduling overruns
- *	#define _TASK_SLEEP_ON_IDLE_RUN // Enable 1 ms SLEEP_IDLE powerdowns between tasks if no callback methods were invoked during the pass 
- *	#define _TASK_STATUS_REQUEST    // Compile with support for StatusRequest functionality - triggering tasks on status change events in addition to time only
- *	#define _TASK_WDT_IDS           // Compile with support for wdt control points and task ids
+ *  #define _TASK_TIMECRITICAL      // Enable monitoring scheduling overruns
+ *  #define _TASK_SLEEP_ON_IDLE_RUN // Enable 1 ms SLEEP_IDLE powerdowns between tasks if no callback methods were invoked during the pass 
+ *  #define _TASK_STATUS_REQUEST    // Compile with support for StatusRequest functionality - triggering tasks on status change events in addition to time only
+ *  #define _TASK_WDT_IDS           // Compile with support for wdt control points and task ids
  *  #define _TASK_LTS_POINTER       // Compile with support for local task storage pointer
- *  #define _TASK_ROLLOVER_FIX		// Compensate for micros() rollover once every 47 days
+ *  #define _TASK_PRIORITY			// Support layered scheduling priority
  */
 
 #ifdef _TASK_SLEEP_ON_IDLE_RUN
@@ -111,12 +129,13 @@ THE SOFTWARE.
 #include <avr/power.h>
 #endif
 
-#define TASK_IMMEDIATE			0
+#define TASK_IMMEDIATE			   0
 #define TASK_SECOND			1000000L
 #define TASK_MINUTE		   60000000L
 #define TASK_HOUR		 3600000000L
-#define TASK_FOREVER		 (-1)
-#define TASK_ONCE				1
+#define TASK_FOREVER		    (-1)
+#define TASK_ONCE		           1
+
 
 #ifdef _TASK_STATUS_REQUEST
 
@@ -134,22 +153,34 @@ class StatusRequest {
 		inline int getStatus() { return iStatus; }
 		
 	private:
-		unsigned int	iCount;  // waiting for more that 65000 events seems unreasonable: unsigned int should be sufficient
-		int				iStatus;  // negative = error;  zero = OK; >positive = OK with a specific status
+		unsigned int	iCount;  					// number of statuses to wait for. waiting for more that 65000 events seems unreasonable: unsigned int should be sufficient
+		int			iStatus;  					// status of the last completed request. negative = error;  zero = OK; >positive = OK with a specific status
 };
 #endif
 
 
+typedef struct  {
+	bool enabled : 1;							// indicates that task is enabled or not.
+	bool inonenable : 1;						// indicates that task execution is inside OnEnable method (preventing infinite loops)
+#ifdef _TASK_STATUS_REQUEST
+	byte	waiting : 2;							// indication if task is waiting on the status request
+#endif
+} __task_status;
+
 class Scheduler; 
+
+
+#ifdef _TASK_WDT_IDS
+	static unsigned int __task_id_counter = 0;		// global task ID counter for assiging task IDs automatically. 
+#endif
 
 class Task {
     friend class Scheduler;
     public:
-		Task(unsigned long aInterval=0, long aIterations=0, void (*aCallback)()=NULL, Scheduler* aScheduler=NULL, boolean aEnable=false, bool (*aOnEnable)()=NULL, void (*aOnDisable)()=NULL);
+		Task(unsigned long aInterval=0, long aIterations=0, void (*aCallback)()=NULL, Scheduler* aScheduler=NULL, bool aEnable=false, bool (*aOnEnable)()=NULL, void (*aOnDisable)()=NULL);
 #ifdef _TASK_STATUS_REQUEST
 		Task(void (*aCallback)()=NULL, Scheduler* aScheduler=NULL, bool (*aOnEnable)()=NULL, void (*aOnDisable)()=NULL);
 #endif
-
 		void enable();
 		bool enableIfNot();
 		void enableDelayed(unsigned long aDelay=0);
@@ -158,7 +189,7 @@ class Task {
 		void restart();
 		void restartDelayed(unsigned long aDelay=0);
 		bool disable();
-		inline bool isEnabled() { return iEnabled; }
+		inline bool isEnabled() { return iStatus.enabled; }
 		void set(unsigned long aInterval, long aIterations, void (*aCallback)(),bool (*aOnEnable)()=NULL, void (*aOnDisable)()=NULL);
 		void setInterval(unsigned long aInterval);
 		inline unsigned long getInterval() { return iInterval; }
@@ -170,6 +201,7 @@ class Task {
 		inline void setOnDisable(void (*aCallback)()) { iOnDisable = aCallback; }
 #ifdef _TASK_TIMECRITICAL
 		inline long getOverrun() { return iOverrun; }
+		inline long getStartDelay() { return iStartDelay; }
 #endif
 		inline bool isFirstIteration() { return (iRunCounter <= 1); } 
 		inline bool isLastIteration() { return (iIterations == 0); }
@@ -192,44 +224,49 @@ class Task {
     private:
 		void reset();
 
-		volatile bool			iEnabled;
-		volatile bool			iInOnEnable;
-		volatile unsigned long	iInterval;
-		volatile unsigned long	iPreviousMillis;
+		volatile __task_status	iStatus;
+		volatile unsigned long	iInterval;			// execution interval in microseconds. 0 - immediate
+		volatile unsigned long	iDelay; 			// actual delay until next execution (usually equal iInterval)
+		volatile unsigned long	iPreviousMicros;	// previous invocation time (micros).  Next invocation = iPreviousMicros + iInterval.  Delayed tasks will "catch up" 
 #ifdef _TASK_TIMECRITICAL
-		volatile long			iOverrun; 
+		volatile long			iOverrun; 			// negative if task is "catching up" to it's schedule (next invocation time is already in the past)
+		volatile long			iStartDelay;		// actual execution of the task's callback method was delayed by this number of micros
 #endif
-		volatile long			iIterations;
-		long					iSetIterations; 
-		unsigned long			iRunCounter;
-		void					(*iCallback)();
-		bool					(*iOnEnable)();
-		void					(*iOnDisable)();
-		Task					*iPrev, *iNext;
-		Scheduler				*iScheduler;
+		volatile long			iIterations;		// number of iterations left. 0 - last iteration. -1 - infinite iterations
+		long					iSetIterations; 		// number of iterations originally requested (for restarts)
+		unsigned long			iRunCounter;		// current number of iteration (starting with 1). Resets on enable. 
+		void					(*iCallback)();		// pointer to the void callback method
+		bool					(*iOnEnable)();		// pointer to the bolol OnEnable callback method
+		void					(*iOnDisable)();	// pointer to the void OnDisable method
+		Task					*iPrev, *iNext;		// pointers to the previous and next tasks in the chain
+		Scheduler				*iScheduler;		// pointer to the current scheduler
 #ifdef _TASK_STATUS_REQUEST
-		StatusRequest			*iStatusRequest;
-		byte					iWaiting;
+		StatusRequest			*iStatusRequest;	// pointer to the status request task is or was waiting on
 #endif
 #ifdef _TASK_WDT_IDS
-		unsigned int			iTaskID;
-		unsigned int			iControlPoint;
+		unsigned int			iTaskID;			// task ID (for debugging and watchdog identification)
+		unsigned int			iControlPoint;		// current control point within the callback method. Reset to 0 by scheduler at the beginning of each pass
 #endif
 #ifdef _TASK_LTS_POINTER
-		void					*iLTS;
+		void					*iLTS;				// pointer to task's local storage. Needs to be recast to appropriate type (usually a struct).
 #endif
 };
+
+
+#ifdef _TASK_PRIORITY
+		static Scheduler* iCurrentScheduler;
+#endif
 
 class Scheduler {
 	friend class Task;
 	public:
 		Scheduler();
-		inline void init() { iFirst = NULL; iLast = NULL; iCurrent = NULL; }
+		void init();
 		void addTask(Task& aTask);
 		void deleteTask(Task& aTask);
-		void disableAll();
-		void enableAll();
-		void execute();
+		void disableAll(bool aRecursive = true);
+		void enableAll(bool aRecursive = true);
+		bool execute();			// Returns true if at none of the tasks' callback methods was invoked (true if idle run)
 		inline Task& currentTask() {return *iCurrent; }
 #ifdef _TASK_SLEEP_ON_IDLE_RUN
 		void allowSleep(bool aState = true) { iAllowSleep = aState; }
@@ -240,19 +277,24 @@ class Scheduler {
 #ifdef _TASK_TIMECRITICAL
 		inline bool isOverrun() { return (iCurrent->iOverrun < 0); }
 #endif
+#ifdef _TASK_PRIORITY
+		void setHighPriorityScheduler(Scheduler* aScheduler);
+		static Scheduler& currentScheduler() { return *(iCurrentScheduler); };
+#endif
 
 	private:
-		Task	*iFirst, *iLast, *iCurrent;
+		Task	*iFirst, *iLast, *iCurrent;			// pointers to first, last and current tasks in the chain
 #ifdef _TASK_SLEEP_ON_IDLE_RUN
-		bool	iAllowSleep;
+		bool	iAllowSleep;						// indication if putting avr to IDLE_SLEEP mode is allowed by the program at this time. 
+#endif
+#ifdef _TASK_PRIORITY
+		Scheduler *iHighPriority;					// Pointer to a higher priority scheduler
 #endif
 };
 
 
 // ------------------ TaskScheduler implementation --------------------
-#ifdef _TASK_WDT_IDS
-	static unsigned int __task_id_counter = 0;
-#endif
+
 /** Constructor, uses default values for the parameters
  * so could be called with no parameters.
  */
@@ -277,7 +319,7 @@ Task::Task( unsigned long aInterval, long aIterations, void (*aCallback)(), Sche
  */
 Task::Task( void (*aCallback)(), Scheduler* aScheduler, bool (*aOnEnable)(), void (*aOnDisable)() ) {
 	reset();
-	set(0, 1, aCallback, aOnEnable, aOnDisable);
+	set(TASK_IMMEDIATE, TASK_ONCE, aCallback, aOnEnable, aOnDisable);
 	if (aScheduler) aScheduler->addTask(*this);
 	iStatusRequest = NULL;
 #ifdef _TASK_WDT_IDS
@@ -313,7 +355,7 @@ void Task::waitFor(StatusRequest* aStatusRequest, unsigned long aInterval, long 
 	if ( ( iStatusRequest = aStatusRequest) ) { // assign internal StatusRequest var and check if it is not NULL
 		setIterations(aIterations);
 		setInterval(aInterval); 
-		iWaiting = _TASK_SR_NODELAY;  // no delay
+		iStatus.waiting = _TASK_SR_NODELAY;  // no delay
 		enable();
 	}
 }
@@ -322,7 +364,7 @@ void Task::waitForDelayed(StatusRequest* aStatusRequest, unsigned long aInterval
 	if ( ( iStatusRequest = aStatusRequest) ) { // assign internal StatusRequest var and check if it is not NULL
 		setIterations(aIterations);
 		if ( aInterval ) setInterval(aInterval);  // For the dealyed version only set the interval if it was not a zero
-		iWaiting = _TASK_SR_DELAY;  // with delay equal to the current interval
+		iStatus.waiting = _TASK_SR_DELAY;  // with delay equal to the current interval
 		enable();
 	}
 }
@@ -333,14 +375,17 @@ void Task::waitForDelayed(StatusRequest* aStatusRequest, unsigned long aInterval
  * out of the execution chain as a result
  */
 void Task::reset() {
-	iEnabled = iInOnEnable = false;
-	iPreviousMillis = 0;
+	iStatus.enabled = false;
+	iStatus.inonenable = false;
+	iPreviousMicros = 0;
+	iInterval = iDelay = 0;
 	iPrev = NULL;
 	iNext = NULL;
 	iScheduler = NULL;
 	iRunCounter = 0;
 #ifdef _TASK_TIMECRITICAL
 	iOverrun = 0;
+	iStartDelay = 0;
 #endif
 #ifdef _TASK_WDT_IDS
 	iControlPoint = 0;
@@ -349,7 +394,7 @@ void Task::reset() {
 	iLTS = NULL;
 #endif
 #ifdef _TASK_STATUS_REQUEST
-	iWaiting = 0;
+	iStatus.waiting = 0;
 #endif
 }
 
@@ -361,7 +406,7 @@ void Task::reset() {
  * @param aOnDisable - pointer to the callback method which is called on disable()
  */
 void Task::set(unsigned long aInterval, long aIterations, void (*aCallback)(),bool (*aOnEnable)(), void (*aOnDisable)()) {
-	iInterval = aInterval;
+	setInterval(aInterval); 
 	iSetIterations = iIterations = aIterations;
 	iCallback = aCallback;
 	iOnEnable = aOnEnable;
@@ -383,18 +428,18 @@ void Task::setIterations(long aIterations) {
 void Task::enable() {
 	if (iScheduler) { // activation without active scheduler does not make sense
 		iRunCounter = 0;
-		if (iOnEnable && !iInOnEnable) {
+		if ( iOnEnable && !iStatus.inonenable ) {
 			Task *current = iScheduler->iCurrent;
 			iScheduler->iCurrent = this;
-			iInOnEnable = true;			// Protection against potential infinite loop
-			iEnabled = (*iOnEnable)();
-			iInOnEnable = false;		// Protection against potential infinite loop
+			iStatus.inonenable = true;		// Protection against potential infinite loop
+			iStatus.enabled = (*iOnEnable)();
+			iStatus.inonenable = false;	  	// Protection against potential infinite loop
 			iScheduler->iCurrent = current;
 		}
 		else {
-			iEnabled = true;
+			iStatus.enabled = true;
 		}
-		iPreviousMillis = micros() - iInterval;
+		iPreviousMicros = micros() - (iDelay = iInterval);
 	}
 }
 
@@ -402,8 +447,8 @@ void Task::enable() {
  * Returns previous state (true if was already enabled, false if was not)
  */
 bool Task::enableIfNot() {
-	bool previousEnabled = iEnabled;
-	if (!iEnabled) enable();
+	bool previousEnabled = iStatus.enabled;
+	if ( !previousEnabled ) enable();
 	return (previousEnabled);
 }
 
@@ -420,8 +465,9 @@ void Task::enableDelayed(unsigned long aDelay) {
  * if aDelay is zero, delays for the original scheduling interval from now
  */
 void Task::delay(unsigned long aDelay) {
-	if (!aDelay) aDelay = iInterval;
-	iPreviousMillis = micros() - iInterval + aDelay;
+//	if (!aDelay) aDelay = iInterval;
+	iDelay = aDelay ? aDelay : iInterval;
+	iPreviousMicros = micros(); // - iInterval + aDelay;
 }
 
 /** Schedules next iteration of Task for execution immediately (if enabled)
@@ -429,7 +475,7 @@ void Task::delay(unsigned long aDelay) {
  * Task's original schedule is shifted, and all subsequent iterations will continue from this point in time
  */
 void Task::forceNextIteration() {
-	iPreviousMillis = micros() - iInterval;
+	iPreviousMicros = micros() - (iDelay = iInterval);
 }
 
 /** Sets the execution interval.
@@ -439,7 +485,7 @@ void Task::forceNextIteration() {
  */
 void Task::setInterval (unsigned long aInterval) {
  	iInterval = aInterval; 
-	delay();
+	delay(); // iDelay will be updated by the delay() function
 }
 
 /** Disables task
@@ -447,8 +493,9 @@ void Task::setInterval (unsigned long aInterval) {
  * Returns status of the task before disable was called (i.e., if the task was already disabled)
  */
 bool Task::disable() {
-	bool previousEnabled = iEnabled;
-	iEnabled = iInOnEnable = false;
+	bool previousEnabled = iStatus.enabled;
+	iStatus.enabled = false;
+	iStatus.inonenable = false; 
 	if (previousEnabled && iOnDisable) {
 		Task *current = iScheduler->iCurrent;
 		iScheduler->iCurrent = this;
@@ -483,6 +530,17 @@ Scheduler::Scheduler() {
 	init();
 #ifdef _TASK_SLEEP_ON_IDLE_RUN
 	iAllowSleep = true;
+#endif
+}
+
+/** Initializes all internal varaibles
+ */
+void Scheduler::init() { 
+	iFirst = NULL; 
+	iLast = NULL; 
+	iCurrent = NULL; 
+#ifdef _TASK_PRIORITY
+	iHighPriority = NULL;
 #endif
 }
 
@@ -542,25 +600,47 @@ void Scheduler::deleteTask(Task& aTask) {
 /** Disables all tasks in the execution chain
  * Convenient for error situations, when the only
  * task remaining active is an error processing task
+ * @param aRecursive - if true, tasks of the higher priority chains are disabled as well recursively
  */
-void Scheduler::disableAll() {
+void Scheduler::disableAll(bool aRecursive) {
 	Task	*current = iFirst;
 	while (current) {
 		current->disable();
 		current = current->iNext;
 	}
+#ifdef _TASK_PRIORITY
+	if (aRecursive && iHighPriority) iHighPriority->disableAll(aRecursive);
+#endif
 }
 
 
 /** Enables all the tasks in the execution chain
+ * @param aRecursive - if true, tasks of the higher priority chains are enabled as well recursively
  */
- void Scheduler::enableAll() {
+ void Scheduler::enableAll(bool aRecursive) {
 	Task	*current = iFirst;
 	while (current) {
 		current->enable();
 		current = current->iNext;
 	}
+#ifdef _TASK_PRIORITY
+	if (aRecursive && iHighPriority) iHighPriority->enableAll(aRecursive);
+#endif
 }
+
+/** Sets scheduler for the higher priority tasks (support for layered task priority)
+ * @param aScheduler - pointer to a scheduler for the higher priority tasks
+ */
+#ifdef _TASK_PRIORITY
+void Scheduler::setHighPriorityScheduler(Scheduler* aScheduler) {
+	if (aScheduler != this) iHighPriority = aScheduler;  // Setting yourself as a higher priority one will create infinite recursive call
+#ifdef _TASK_SLEEP_ON_IDLE_RUN
+	if (iHighPriority) {
+		iHighPriority->allowSleep(false);		// Higher priority schedulers should not do power management
+	}
+#endif
+};
+#endif
 
 /** Makes one pass through the execution chain.
  * Tasks are executed in the order they were added to the chain
@@ -568,22 +648,27 @@ void Scheduler::disableAll() {
  * Different pseudo "priority" could be achieved
  * by running task more frequently 
  */
-void Scheduler::execute() {
-#ifdef _TASK_SLEEP_ON_IDLE_RUN
-	bool		idleRun = true;
-#endif
-	unsigned long targetMillis;
-	register unsigned long m, i, p;
+bool Scheduler::execute() {
+	bool	 idleRun = true;
+	register unsigned long m, i;  // micros, interval;
 	
 	iCurrent = iFirst;
+	
+	while (iCurrent) {
+		
+#ifdef _TASK_PRIORITY
+	// If scheduler for higher priority tasks is set, it's entire chain is executed on every pass of the base scheduler
+		if (iHighPriority) idleRun = iHighPriority->execute() && idleRun; 
+		iCurrentScheduler = this;
+#endif
 
-	while (iCurrent) { 
-		do {   		
-			if (iCurrent->iEnabled) {
-	#ifdef _TASK_WDT_IDS
+		do {
+			if ( iCurrent->iStatus.enabled ) {
+
+#ifdef _TASK_WDT_IDS
 	// For each task the control points are initialized to avoid confusion because of carry-over:
 				iCurrent->iControlPoint = 0;
-	#endif
+#endif
 	
 	// Disable task on last iteration:
 				if (iCurrent->iIterations == 0) {
@@ -591,55 +676,45 @@ void Scheduler::execute() {
 					break;
 				}
 				m = micros();
-				p = iCurrent->iPreviousMillis;
 				i = iCurrent->iInterval;
-	#ifdef  _TASK_STATUS_REQUEST
+
+#ifdef  _TASK_STATUS_REQUEST
 	// If StatusRequest object was provided, and still pending, and task is waiting, this task should not run
 	// Otherwise, continue with execution as usual.  Tasks waiting to StatusRequest need to be rescheduled according to 
 	// how they were placed into waiting state (waitFor or waitForDelayed)
-				if ( iCurrent->iWaiting ) {
+				if ( iCurrent->iStatus.waiting ) {
 					if ( (iCurrent->iStatusRequest)->pending() ) break;
-					iCurrent->iPreviousMillis = (iCurrent->iWaiting == _TASK_SR_NODELAY) ? m - i : m;
-					iCurrent->iWaiting = 0;
+					if (iCurrent->iStatus.waiting == _TASK_SR_NODELAY) {
+						iCurrent->iPreviousMicros = m - (iCurrent->iDelay = i);
+					}
+					else {
+						iCurrent->iPreviousMicros = m;
+					}
+					iCurrent->iStatus.waiting = 0;
 				}
-	#endif
-	// Determine when current task is supposed to run
-	// Once every 47 days there is a rollover execution which will occur due to millis and targetMillis rollovers
-	// That is why there is an option to compile with rollover fix
-	// Example
-	//	iPreviousMillis = 65000
-	//	iInterval = 600
-	//	micros() = 65500
-	//  targetMillis = 65000 + 600 = (should be 65600) 65 (due to rollover)
-	//	so 65 < 65500. should be 65600 > 65500. - task will be scheduled incorrectly
-	//  since targetMillis (65) < iPreviousMillis (65000), rollover fix kicks in:
-	//  iPreviousMillis(65000) > millis(65500) - iInterval(600) = 64900 - task will not be scheduled
-	
-				targetMillis = p + i;
-	#ifdef _TASK_ROLLOVER_FIX
-				if ( targetMillis < p ) {  // targetMillis rolled over!
-					if ( p > ( m - i) )  break;
-				}
-				else
-	#endif
-					if ( targetMillis > m ) break;
-	
-	#ifdef _TASK_TIMECRITICAL
-	// Updated_previous+current interval should put us into the future, so iOverrun should be positive or zero. 
-	// If negative - the task is behind (next execution time is already in the past) 
-				iCurrent->iOverrun = (long) ( targetMillis - m + i );
-	#endif
+#endif
+
+				if ( m - iCurrent->iPreviousMicros < iCurrent->iDelay ) break;
+
 				if ( iCurrent->iIterations > 0 ) iCurrent->iIterations--;  // do not decrement (-1) being a signal of never-ending task
 				iCurrent->iRunCounter++;
+				iCurrent->iPreviousMicros += iCurrent->iDelay;
+
+#ifdef _TASK_TIMECRITICAL
+	// Updated_previous+current interval should put us into the future, so iOverrun should be positive or zero. 
+	// If negative - the task is behind (next execution time is already in the past) 
+				unsigned long p = iCurrent->iPreviousMicros;
+				iCurrent->iOverrun = (long) ( p + i - m );
+				iCurrent->iStartDelay = (long) ( m - p ); 
+#endif
+
+				iCurrent->iDelay = i;
 				if ( iCurrent->iCallback ) {
 					( *(iCurrent->iCallback) )();
-	#ifdef _TASK_SLEEP_ON_IDLE_RUN
 					idleRun = false;
-	#endif
 				}
-				iCurrent->iPreviousMillis = targetMillis;
 			}
-		} while (0); //guaranteed single run - allows use of "break" to exit 
+		} while (0); 	//guaranteed single run - allows use of "break" to exit 
 		iCurrent = iCurrent->iNext;
 	}
 
@@ -654,6 +729,8 @@ void Scheduler::execute() {
 	  sleep_disable(); /* First thing to do is disable sleep. */
 	}
 #endif
+
+	return (idleRun);
 }
 
 
