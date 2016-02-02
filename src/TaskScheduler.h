@@ -1,4 +1,4 @@
-// Cooperative multitasking library for Arduino version 2.0.1
+// Cooperative multitasking library for Arduino version 2.0.2
 // Copyright (c) 2015 Anatoli Arkhipenko
 //
 // Changelog:
@@ -56,10 +56,10 @@
 //    2015-11-05 - implement waitForDelayed() method to allow task activation on the status request completion delayed for one current interval
 //    2015-11-09 - added callback methods prototypes to all examples for Arduino IDE 1.6.6 compatibility
 //    2015-11-14 - added several constants to be used as task parameters for readability (e.g, TASK_FOREVER, TASK_SECOND, etc.)
-//    2015-11-14 - significant optimization of the scheduler's execute loop, including micros() rollover fix option
+//    2015-11-14 - significant optimization of the scheduler's execute loop, including millis() rollover fix option
 //
 // v1.8.4:
-//    2015-11-15 - bug fix: Task alignment with micros() for scheduling purposes should be done after OnEnable, not before. Especially since OnEnable method can change the interval
+//    2015-11-15 - bug fix: Task alignment with millis() for scheduling purposes should be done after OnEnable, not before. Especially since OnEnable method can change the interval
 //    2015-11-16 - further optimizations of the task scheduler execute loop
 //
 // v1.8.5:
@@ -71,7 +71,7 @@
 //
 // v1.9.2:
 //    2015-11-28 - _TASK_ROLLOVER_FIX is deprecated (not necessary)
-//    2015-12-16 - bug fixes: automatic micros rollover support for delay methods
+//    2015-12-16 - bug fixes: automatic millis rollover support for delay methods
 //    2015-12-17 - new method for _TASK_TIMECRITICAL option: getStartDelay() 
 //
 // v2.0.0:
@@ -79,7 +79,13 @@
 //
 // v2.0.1:
 //    2016-01-02 - bug fix: issue#11 Xtensa compiler (esp8266): Declaration of constructor does not match implementation
-
+//
+// v2.0.2:
+//    2016-01-05 - bug fix: time constants wrapped inside compile option
+//    2016-01-05 - support for ESP8266 wifi power saving mode for _TASK_SLEEP_ON_IDLE_RUN compile option
+//
+// v2.1.0:
+//    2016-02-01 - support for microsecond resolution
 
 /* ============================================
 Cooperative multitasking library code is placed under the MIT license
@@ -121,20 +127,55 @@ THE SOFTWARE.
  *  #define _TASK_STATUS_REQUEST    // Compile with support for StatusRequest functionality - triggering tasks on status change events in addition to time only
  *  #define _TASK_WDT_IDS           // Compile with support for wdt control points and task ids
  *  #define _TASK_LTS_POINTER       // Compile with support for local task storage pointer
- *  #define _TASK_PRIORITY			// Support layered scheduling priority
+ *  #define _TASK_PRIORITY			// Support for layered scheduling priority
+ *  #define _TASK_MICRO_RES			// Support for microsecond resolution
  */
 
+
+ #ifdef _TASK_MICRO_RES
+ 
+ #undef _TASK_SLEEP_ON_IDLE_RUN		// SLEEP_ON_IDLE has only millisecond resolution
+ #define _TASK_TIME_FUNCTION() micros()
+ 
+ #else
+	 
+ #define _TASK_TIME_FUNCTION() millis()
+ 
+ #endif
+ 
 #ifdef _TASK_SLEEP_ON_IDLE_RUN
+
+#ifdef ARDUINO_ARCH_AVR  
 #include <avr/sleep.h>
 #include <avr/power.h>
 #endif
 
-#define TASK_IMMEDIATE			   0
-#define TASK_SECOND			1000000L
-#define TASK_MINUTE		   60000000L
-#define TASK_HOUR		 3600000000L
-#define TASK_FOREVER		    (-1)
-#define TASK_ONCE		           1
+#ifdef ARDUINO_ARCH_ESP8266
+extern "C" {
+#include "user_interface.h"
+}
+#endif
+
+#endif
+
+#define TASK_IMMEDIATE			0
+#define TASK_FOREVER		 (-1)
+#define TASK_ONCE				1
+
+
+#ifndef _TASK_MICRO_RES
+
+#define TASK_SECOND			1000L
+#define TASK_MINUTE		   60000L
+#define TASK_HOUR		 3600000L
+
+#else
+
+#define TASK_SECOND		1000000L
+#define TASK_MINUTE	   60000000L
+#define TASK_HOUR	 3600000000L
+
+#endif
 
 
 #ifdef _TASK_STATUS_REQUEST
@@ -181,6 +222,7 @@ class Task {
 #ifdef _TASK_STATUS_REQUEST
 		Task(void (*aCallback)()=NULL, Scheduler* aScheduler=NULL, bool (*aOnEnable)()=NULL, void (*aOnDisable)()=NULL);
 #endif
+
 		void enable();
 		bool enableIfNot();
 		void enableDelayed(unsigned long aDelay=0);
@@ -225,12 +267,12 @@ class Task {
 		void reset();
 
 		volatile __task_status	iStatus;
-		volatile unsigned long	iInterval;			// execution interval in microseconds. 0 - immediate
+		volatile unsigned long	iInterval;			// execution interval in milliseconds (or microseconds). 0 - immediate
 		volatile unsigned long	iDelay; 			// actual delay until next execution (usually equal iInterval)
-		volatile unsigned long	iPreviousMicros;	// previous invocation time (micros).  Next invocation = iPreviousMicros + iInterval.  Delayed tasks will "catch up" 
+		volatile unsigned long	iPreviousMillis;	// previous invocation time (millis).  Next invocation = iPreviousMillis + iInterval.  Delayed tasks will "catch up" 
 #ifdef _TASK_TIMECRITICAL
 		volatile long			iOverrun; 			// negative if task is "catching up" to it's schedule (next invocation time is already in the past)
-		volatile long			iStartDelay;		// actual execution of the task's callback method was delayed by this number of micros
+		volatile long			iStartDelay;		// actual execution of the task's callback method was delayed by this number of millis
 #endif
 		volatile long			iIterations;		// number of iterations left. 0 - last iteration. -1 - infinite iterations
 		long					iSetIterations; 		// number of iterations originally requested (for restarts)
@@ -269,7 +311,7 @@ class Scheduler {
 		bool execute();			// Returns true if at none of the tasks' callback methods was invoked (true if idle run)
 		inline Task& currentTask() {return *iCurrent; }
 #ifdef _TASK_SLEEP_ON_IDLE_RUN
-		void allowSleep(bool aState = true) { iAllowSleep = aState; }
+		void allowSleep(bool aState = true);
 #endif
 #ifdef _TASK_LTS_POINTER
 		inline void* currentLts() {return iCurrent->iLTS; }
@@ -377,7 +419,7 @@ void Task::waitForDelayed(StatusRequest* aStatusRequest, unsigned long aInterval
 void Task::reset() {
 	iStatus.enabled = false;
 	iStatus.inonenable = false;
-	iPreviousMicros = 0;
+	iPreviousMillis = 0;
 	iInterval = iDelay = 0;
 	iPrev = NULL;
 	iNext = NULL;
@@ -439,7 +481,7 @@ void Task::enable() {
 		else {
 			iStatus.enabled = true;
 		}
-		iPreviousMicros = micros() - (iDelay = iInterval);
+		iPreviousMillis = _TASK_TIME_FUNCTION() - (iDelay = iInterval);
 	}
 }
 
@@ -467,7 +509,7 @@ void Task::enableDelayed(unsigned long aDelay) {
 void Task::delay(unsigned long aDelay) {
 //	if (!aDelay) aDelay = iInterval;
 	iDelay = aDelay ? aDelay : iInterval;
-	iPreviousMicros = micros(); // - iInterval + aDelay;
+	iPreviousMillis = _TASK_TIME_FUNCTION(); // - iInterval + aDelay;
 }
 
 /** Schedules next iteration of Task for execution immediately (if enabled)
@@ -475,7 +517,7 @@ void Task::delay(unsigned long aDelay) {
  * Task's original schedule is shifted, and all subsequent iterations will continue from this point in time
  */
 void Task::forceNextIteration() {
-	iPreviousMicros = micros() - (iDelay = iInterval);
+	iPreviousMillis = _TASK_TIME_FUNCTION() - (iDelay = iInterval);
 }
 
 /** Sets the execution interval.
@@ -528,9 +570,6 @@ void Task::restartDelayed(unsigned long aDelay) {
  */
 Scheduler::Scheduler() {
 	init();
-#ifdef _TASK_SLEEP_ON_IDLE_RUN
-	iAllowSleep = true;
-#endif
 }
 
 /** Initializes all internal varaibles
@@ -541,6 +580,9 @@ void Scheduler::init() {
 	iCurrent = NULL; 
 #ifdef _TASK_PRIORITY
 	iHighPriority = NULL;
+#endif
+#ifdef _TASK_SLEEP_ON_IDLE_RUN
+	allowSleep(true);
 #endif
 }
 
@@ -642,6 +684,19 @@ void Scheduler::setHighPriorityScheduler(Scheduler* aScheduler) {
 };
 #endif
 
+
+#ifdef _TASK_SLEEP_ON_IDLE_RUN
+void Scheduler::allowSleep(bool aState) { 
+	iAllowSleep = aState; 
+
+#ifdef ARDUINO_ARCH_ESP8266
+	wifi_set_sleep_type( iAllowSleep ? LIGHT_SLEEP_T : NONE_SLEEP_T );
+#endif
+
+}
+#endif
+
+
 /** Makes one pass through the execution chain.
  * Tasks are executed in the order they were added to the chain
  * There is no concept of priority
@@ -650,8 +705,13 @@ void Scheduler::setHighPriorityScheduler(Scheduler* aScheduler) {
  */
 bool Scheduler::execute() {
 	bool	 idleRun = true;
-	register unsigned long m, i;  // micros, interval;
-	
+	register unsigned long m, i;  // millis, interval;
+
+#ifdef ARDUINO_ARCH_ESP8266
+	  unsigned long t1 = micros();
+	  unsigned long t2 = 0;
+#endif
+
 	iCurrent = iFirst;
 	
 	while (iCurrent) {
@@ -675,7 +735,7 @@ bool Scheduler::execute() {
 					iCurrent->disable();
 					break;
 				}
-				m = micros();
+				m = _TASK_TIME_FUNCTION();
 				i = iCurrent->iInterval;
 
 #ifdef  _TASK_STATUS_REQUEST
@@ -685,25 +745,25 @@ bool Scheduler::execute() {
 				if ( iCurrent->iStatus.waiting ) {
 					if ( (iCurrent->iStatusRequest)->pending() ) break;
 					if (iCurrent->iStatus.waiting == _TASK_SR_NODELAY) {
-						iCurrent->iPreviousMicros = m - (iCurrent->iDelay = i);
+						iCurrent->iPreviousMillis = m - (iCurrent->iDelay = i);
 					}
 					else {
-						iCurrent->iPreviousMicros = m;
+						iCurrent->iPreviousMillis = m;
 					}
 					iCurrent->iStatus.waiting = 0;
 				}
 #endif
 
-				if ( m - iCurrent->iPreviousMicros < iCurrent->iDelay ) break;
+				if ( m - iCurrent->iPreviousMillis < iCurrent->iDelay ) break;
 
 				if ( iCurrent->iIterations > 0 ) iCurrent->iIterations--;  // do not decrement (-1) being a signal of never-ending task
 				iCurrent->iRunCounter++;
-				iCurrent->iPreviousMicros += iCurrent->iDelay;
+				iCurrent->iPreviousMillis += iCurrent->iDelay;
 
 #ifdef _TASK_TIMECRITICAL
 	// Updated_previous+current interval should put us into the future, so iOverrun should be positive or zero. 
 	// If negative - the task is behind (next execution time is already in the past) 
-				unsigned long p = iCurrent->iPreviousMicros;
+				unsigned long p = iCurrent->iPreviousMillis;
 				iCurrent->iOverrun = (long) ( p + i - m );
 				iCurrent->iStartDelay = (long) ( m - p ); 
 #endif
@@ -720,6 +780,8 @@ bool Scheduler::execute() {
 
 #ifdef _TASK_SLEEP_ON_IDLE_RUN
   	if (idleRun && iAllowSleep) {
+
+#ifdef ARDUINO_ARCH_AVR	// Could be used only for AVR-based boards. 
   	  set_sleep_mode(SLEEP_MODE_IDLE);
   	  sleep_enable();
 	  /* Now enter sleep mode. */
@@ -727,6 +789,13 @@ bool Scheduler::execute() {
 	  
 	  /* The program will continue from here after the timer timeout ~1 ms */
 	  sleep_disable(); /* First thing to do is disable sleep. */
+#endif
+
+#ifdef ARDUINO_ARCH_ESP8266
+// to do: find suitable sleep function for esp8266
+	  t2 = micros() - t1;
+	  if (t2 < 1000L) delay(1); 	// ESP8266 implementation of delay() uses timers and yield
+#endif
 	}
 #endif
 
